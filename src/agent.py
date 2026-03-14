@@ -7,24 +7,25 @@ import random
 import numpy as np
 from collections import deque
 
-from .environment import CarGameAI, NUM_SENSORS
+from .environment import CarGameAI, STATE_SIZE
 from .model        import Linear_QNet, QTrainer
 from .utils        import plot
 
 MAX_MEMORY = 100_000
-BATCH_SIZE = 1_000
-LR         = 0.001
+BATCH_SIZE = 2_000    # larger batch → smoother gradient estimates
+LR         = 0.0002   # lower LR → avoids weight overshooting in exploitation phase
 
 
 class CarAgent:
     def __init__(self):
         self.n_games = 0
-        self.epsilon = 0          # exploration rate (decays with n_games)
-        self.gamma   = 0.9        # discount factor
+        self.epsilon = 0
+        self.gamma   = 0.90       # slightly shorter horizon → more stable value estimates
         self.memory  = deque(maxlen=MAX_MEMORY)
 
-        # 7 sensor inputs  →  256 hidden  →  3 actions (straight / right / left)
-        self.model   = Linear_QNet(NUM_SENSORS, 256, 3)
+        # 11 inputs → 256 hidden → 3 actions
+        self.model   = Linear_QNet(STATE_SIZE, 256, 3)
+        self.model.load("car_model.pth")   # resume from saved brain if it exists
         self.trainer = QTrainer(self.model, lr=LR, gamma=self.gamma)
 
     # ── State ──────────────────────────────────────────────────────────────────
@@ -47,10 +48,10 @@ class CarAgent:
 
     # ── Action selection ───────────────────────────────────────────────────────
     def get_action(self, state: np.ndarray):
-        # Linear epsilon-greedy: fully random for first ~80 games, then exploits
-        self.epsilon = 80 - self.n_games
+        # Decay exploration over 400 games, floor at ~8% — gives enough time to learn
+        self.epsilon = max(30, 400 - self.n_games)
         move = [0, 0, 0]
-        if random.randint(0, 200) < self.epsilon:
+        if random.randint(0, 400) < self.epsilon:
             move[random.randint(0, 2)] = 1
         else:
             pred = self.model(torch.tensor(state, dtype=torch.float))
@@ -86,7 +87,11 @@ def train():
 
             if score > record:
                 record = score
-                agent.model.save("car_model.pth")
+                agent.model.save("car_model.pth")   # save best brain
+
+            # Also checkpoint every 25 games so no progress is ever lost
+            if agent.n_games % 25 == 0:
+                agent.model.save("car_model_checkpoint.pth")
 
             print(f"Game {agent.n_games:4d} | Score {score:6d} | Record {record:6d}")
 

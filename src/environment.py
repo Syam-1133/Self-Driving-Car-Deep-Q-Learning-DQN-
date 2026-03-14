@@ -17,17 +17,37 @@ SCREEN_W = 1100
 SCREEN_H = 750
 
 # ── Car physics ───────────────────────────────────────────────────────────────
-CAR_SPEED  = 3.0    # px / frame  (constant forward speed)
-TURN_SPEED = 4.5    # degrees / frame
-TIMEOUT    = 1800   # max frames per episode
+CAR_SPEED  = 4.0    # px / frame  (constant forward speed)
+TURN_SPEED = 5.0    # degrees / frame
+TIMEOUT    = 2000   # max frames per episode
 
 # ── Sensors ───────────────────────────────────────────────────────────────────
-NUM_SENSORS    = 7
+NUM_SENSORS    = 9
 SENSOR_MAX     = 220
-SENSOR_OFFSETS = [-90, -60, -30, 0, 30, 60, 90]  # degrees relative to heading
+# Denser in the forward arc so the car sees corners earlier
+SENSOR_OFFSETS = [-90, -60, -30, -15, 0, 15, 30, 60, 90]
+
+# ── Checkpoints (evenly spaced around circuit, car must hit in order) ─────────
+# Subset of TRACK_PTS indices chosen to cover every major section
+CHECKPOINTS = [
+    (700, 660),   # CP1 — end of main straight
+    (970, 540),   # CP2 — T1 exit
+    (900, 200),   # CP3 — top braking zone
+    (760, 100),   # CP4 — hairpin apex
+    (560, 240),   # CP5 — S-curves
+    (320, 280),   # CP6 — chicane
+    (160, 500),   # CP7 — slow left apex
+    (220, 620),   # CP8 — return chicane
+]
+CHECKPOINT_RADIUS  = 55   # px — how close the car must get to collect
+CHECKPOINT_REWARD  = 50   # reward per checkpoint
+LAP_REWARD         = 200  # bonus for completing a full lap
+
+# Total state size: 7 sensors + angle-to-next-CP + dist-to-next-CP
+STATE_SIZE = NUM_SENSORS + 2
 
 # ── Track ─────────────────────────────────────────────────────────────────────
-TRACK_WIDTH = 85   # road width in pixels
+TRACK_WIDTH = 95   # road width in pixels (wider = more margin for learning)
 
 # Closed-loop centerline waypoints (first == last to close the loop)
 TRACK_PTS = [
@@ -287,9 +307,13 @@ class CarGameAI:
         self.y      = 660.0
         self.angle  = 0.0     # 0=east, 90=south (pygame y-down), etc.
 
-        self.score       = 0
-        self.frame_iter  = 0
+        self.score        = 0
+        self.frame_iter   = 0
         self.sensor_dists = [float(SENSOR_MAX)] * NUM_SENSORS
+        self.next_cp      = 0   # index into CHECKPOINTS
+        self.laps         = 0
+        self.prev_x       = self.x   # for progress calculation
+        self.prev_y       = self.y
         return self.get_state()
 
     # ── Core step ─────────────────────────────────────────────────────────────
@@ -331,15 +355,52 @@ class CarGameAI:
             self._update_ui()
             return -1, True, self.score
 
+        # ── Reward shaping ─────────────────────────────────────────────────
+        cx, cy = CHECKPOINTS[self.next_cp]
+
+        # 1) Dense progress: reward how much closer we got to the next CP this frame
+        prev_dist = math.hypot(self.prev_x - cx, self.prev_y - cy)
+        curr_dist = math.hypot(self.x       - cx, self.y       - cy)
+        progress  = (prev_dist - curr_dist) / CAR_SPEED   # 1.0 = heading straight at CP
+        reward = 1.0 + max(progress, 0.0) * 2.0           # range [1, 3] per frame
+
+        # 2) Wall proximity penalty — discourages hugging walls / zigzagging
+        min_sensor = min(self.sensor_dists) if self.sensor_dists else SENSOR_MAX
+        if min_sensor < 30:
+            reward -= (30.0 - min_sensor) / 30.0 * 1.5    # up to -1.5 near wall
+
+        # 3) Checkpoint gate
+        if curr_dist < CHECKPOINT_RADIUS:
+            reward += CHECKPOINT_REWARD
+            self.next_cp = (self.next_cp + 1) % len(CHECKPOINTS)
+            if self.next_cp == 0:
+                reward += LAP_REWARD
+                self.laps += 1
+
+        self.prev_x = self.x
+        self.prev_y = self.y
         self.score += 1
         self._update_ui()
         self.clock.tick(60)
-        return 1, False, self.score
+        return reward, False, self.score
 
     # ── State ─────────────────────────────────────────────────────────────────
     def get_state(self) -> np.ndarray:
+        # 7 normalised sensor distances
         dists = self._cast_sensors()
-        return np.array([d / SENSOR_MAX for d in dists], dtype=np.float32)
+        state = [d / SENSOR_MAX for d in dists]
+
+        # Angle to next checkpoint relative to car heading  (-1 = hard left, +1 = hard right)
+        cx, cy = CHECKPOINTS[self.next_cp]
+        abs_angle = math.degrees(math.atan2(cy - self.y, cx - self.x))
+        rel_angle  = (abs_angle - self.angle + 180) % 360 - 180   # -180 … +180
+        state.append(rel_angle / 180.0)
+
+        # Normalised distance to next checkpoint (0 = here, 1 = far away)
+        dist_to_cp = math.hypot(cx - self.x, cy - self.y)
+        state.append(min(dist_to_cp / 600.0, 1.0))
+
+        return np.array(state, dtype=np.float32)   # shape: (STATE_SIZE,) = (9,)
 
     # ── Sensors ───────────────────────────────────────────────────────────────
     def _cast_sensors(self):
@@ -405,12 +466,18 @@ class CarGameAI:
         rect = rotated.get_rect(center=(int(self.x), int(self.y)))
         self.display.blit(rotated, rect)
 
+        # ── Next checkpoint marker (green pulsing ring) ───────────────────
+        cx, cy = CHECKPOINTS[self.next_cp]
+        pygame.draw.circle(self.display, (0, 230, 80),  (int(cx), int(cy)), CHECKPOINT_RADIUS, 2)
+        pygame.draw.circle(self.display, (0, 255, 100), (int(cx), int(cy)), 6)
+
         # ── HUD ───────────────────────────────────────────────────────────
-        # Score panel (semi-transparent background)
-        panel = pygame.Surface((180, 36), pygame.SRCALPHA)
-        panel.fill((0, 0, 0, 140))
+        panel = pygame.Surface((240, 72), pygame.SRCALPHA)
+        panel.fill((0, 0, 0, 150))
         self.display.blit(panel, (8, 8))
-        score_txt = self.hud_font.render(f"Score: {self.score}", True, C_HUD)
-        self.display.blit(score_txt, (14, 14))
+        self.display.blit(self.hud_font.render(f"Score : {self.score}",  True, C_HUD), (14, 12))
+        self.display.blit(self.hud_font.render(f"Laps  : {self.laps}",   True, C_HUD), (14, 34))
+        self.display.blit(self.hud_font.render(
+            f"CP    : {self.next_cp + 1}/{len(CHECKPOINTS)}", True, (0, 230, 80)), (14, 56))
 
         pygame.display.flip()
